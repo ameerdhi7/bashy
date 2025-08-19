@@ -12,6 +12,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}"
 
+# Allow overriding PROJECT_DIR with BASHY_PROJECT_PATH from environment or .env
+if [[ -n "${BASHY_PROJECT_PATH:-}" ]]; then
+  PROJECT_DIR="${BASHY_PROJECT_PATH}"
+fi
+
 # Defaults (can be overridden by .env)
 DEFAULT_NAME="$(basename "${PROJECT_DIR}" | tr '[:space:]' '-' | tr -cd '[:alnum:]-_.' | tr '[:upper:]' '[:lower:]')"
 DEFAULT_PORT="5173"
