@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 
-# Bashy: simple dev service manager for macOS launchd with local domain support
-# - Keeps your dev server running across restarts via a LaunchAgent
+# Bashy: simple dev service manager using PM2 with local domain support
+# - Syncs your project's .env from .env.example and injects PORT/HOST
+# - Keeps your dev server running with PM2 (auto restart on crash)
 # - Registers/unregisters a local domain in /etc/hosts (requires sudo)
+# - Adds the embedded bashy directory to your project's .gitignore
 # - Stores config in .bashy.env at project root
 
 set -euo pipefail
@@ -10,9 +12,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}"
 CONFIG_FILE="${PROJECT_DIR}/.bashy.env"
-LAUNCH_AGENTS_DIR="${HOME}/Library/LaunchAgents"
-LOGS_DIR="${HOME}/.bashy/logs"
-mkdir -p "${LOGS_DIR}" "${LAUNCH_AGENTS_DIR}"
 
 # Defaults (can be overridden by .bashy.env)
 DEFAULT_NAME="$(basename "${PROJECT_DIR}" | tr '[:space:]' '-' | tr -cd '[:alnum:]-_.' | tr '[:upper:]' '[:lower:]')"
@@ -35,31 +34,28 @@ BASHY_WORKDIR="${DEFAULT_WORKDIR}"
 BASHY_COMMAND="${DEFAULT_COMMAND}"
 BASHY_ENV_EXTRA="" # optional K=V,K=V pairs (comma-separated)
 
-LABEL() { echo "dev.bashy.${BASHY_NAME}"; }
-PLIST_PATH() { echo "${LAUNCH_AGENTS_DIR}/$(LABEL).plist"; }
-LOG_FILE() { echo "${LOGS_DIR}/${BASHY_NAME}.log"; }
-
 print_info() { printf "[bashy] %s\n" "$*"; }
 print_err() { printf "[bashy] ERROR: %s\n" "$*" 1>&2; }
 
 usage() {
   cat <<'EOF'
-Bashy - automate front-end dev serving with local domain and persistence (macOS)
+Bashy - automate front-end dev serving with local domain and PM2 keep-alive
 
 Usage:
+  ./bashy.sh up [--name NAME] [--domain DOMAIN] [--port PORT] [--workdir DIR] [--command CMD] [--env "K=V,K=V"]
   ./bashy.sh init [--name NAME] [--domain DOMAIN] [--port PORT] [--workdir DIR] [--command CMD] [--env "K=V,K=V"]
-  ./bashy.sh install                 # write LaunchAgent from .bashy.env and load it (starts at login)
-  ./bashy.sh uninstall               # unload and remove LaunchAgent
-  ./bashy.sh start|stop|restart      # control the LaunchAgent process
-  ./bashy.sh status                  # show launchd status
-  ./bashy.sh logs [--follow]         # show logs (tail -f with --follow)
+  ./bashy.sh start|stop|restart      # control the PM2 process
+  ./bashy.sh status                  # show PM2 status
+  ./bashy.sh logs [--follow]         # show PM2 logs (tail -f with --follow)
+  ./bashy.sh delete                  # delete process from PM2
+  ./bashy.sh save                    # pm2 save (persist process list)
   ./bashy.sh register-domain [IP]    # add DOMAIN -> IP (default 127.0.0.1) in /etc/hosts (sudo)
   ./bashy.sh unregister-domain       # remove DOMAIN entry from /etc/hosts (sudo)
   ./bashy.sh config                  # print effective config
   ./bashy.sh help
 
 Notes:
-  - Edit .bashy.env to customize. ENV vars exported to your command: PORT, HOST.
+  - Requires pm2 (npm i -g pm2). ENV vars exported to your command: PORT, HOST.
   - Vite/Vue example: npm run dev -- --host 0.0.0.0 --port $PORT
   - Next.js example: npm run dev -p $PORT -H 0.0.0.0
 EOF
@@ -93,131 +89,126 @@ EOF
   print_info "Wrote config ${CONFIG_FILE}"
 }
 
-parse_kv_csv_to_plist_env() {
+csv_to_inline_env_exports() {
   local csv="$1"
-  if [[ -z "${csv}" ]]; then return 0; fi
-  # Expect comma-separated K=V pairs
+  local out=""
+  if [[ -z "${csv}" ]]; then echo ""; return 0; fi
   IFS=',' read -r -a pairs <<< "${csv}"
   for pair in "${pairs[@]}"; do
     local key="${pair%%=*}"
     local val="${pair#*=}"
     [[ -z "${key}" ]] && continue
-    printf "      <key>%s</key>\n      <string>%s</string>\n" "${key}" "${val}"
+    # single-quote value safely
+    out+=" ${key}='${val//'\''/'\'''}'"
   done
+  echo "${out}"
 }
 
-write_plist() {
-  load_env
-  local plist="$(PLIST_PATH)"
-  local label="$(LABEL)"
-  local log_file="$(LOG_FILE)"
-  mkdir -p "${LAUNCH_AGENTS_DIR}"
-  mkdir -p "${LOGS_DIR}"
-
-  cat > "${plist}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${label}</string>
-
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/zsh</string>
-    <string>-lc</string>
-    <string>cd '${BASHY_WORKDIR}' && ${BASHY_COMMAND}</string>
-  </array>
-
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PORT</key>
-    <string>${BASHY_PORT}</string>
-    <key>HOST</key>
-    <string>${BASHY_DOMAIN}</string>
-$(parse_kv_csv_to_plist_env "${BASHY_ENV_EXTRA}")  </dict>
-
-  <key>WorkingDirectory</key>
-  <string>${BASHY_WORKDIR}</string>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>${log_file}</string>
-  <key>StandardErrorPath</key>
-  <string>${log_file}</string>
-</dict>
-</plist>
-EOF
-  print_info "Wrote LaunchAgent ${plist}"
-}
-
-install_agent() {
-  write_plist
-  local plist="$(PLIST_PATH)"
-  # unload if already loaded
-  if launchctl list | grep -q "$(LABEL)"; then
-    launchctl unload -w "${plist}" || true
-  fi
-  launchctl load -w "${plist}"
-  print_info "Installed and loaded $(LABEL). It will start at login and stay alive."
-}
-
-uninstall_agent() {
-  load_env
-  local plist="$(PLIST_PATH)"
-  if [[ -f "${plist}" ]]; then
-    launchctl unload -w "${plist}" || true
-    rm -f "${plist}"
-    print_info "Uninstalled LaunchAgent $(LABEL)"
-  else
-    print_info "No LaunchAgent to uninstall at ${plist}"
-  fi
-}
-
-start_agent() {
-  load_env
-  launchctl start "$(LABEL)" || true
-  print_info "Start signaled for $(LABEL)."
-}
-
-stop_agent() {
-  load_env
-  launchctl stop "$(LABEL)" || true
-  print_info "Stop signaled for $(LABEL)."
-}
-
-restart_agent() {
-  load_env
-  local plist="$(PLIST_PATH)"
-  if [[ -f "${plist}" ]]; then
-    launchctl unload -w "${plist}" || true
-    launchctl load -w "${plist}"
-    print_info "Restarted $(LABEL)."
-  else
-    print_err "Plist not found. Run: ./bashy.sh install"
+ensure_pm2() {
+  if ! command -v pm2 >/dev/null 2>&1; then
+    print_err "pm2 not found. Install with: npm i -g pm2"
     exit 1
   fi
 }
 
+pm2_start() {
+  load_env
+  ensure_pm2
+  local inline_env="PORT='${BASHY_PORT}' HOST='${BASHY_DOMAIN}'$(csv_to_inline_env_exports "${BASHY_ENV_EXTRA}")"
+  # Use zsh login shell so nvm and PATH customizations load
+  pm2 start /bin/zsh \
+    --name "${BASHY_NAME}" \
+    --cwd "${BASHY_WORKDIR}" \
+    -- -lc "cd '${BASHY_WORKDIR}' && ${inline_env} ${BASHY_COMMAND}"
+  print_info "PM2 started process ${BASHY_NAME}."
+}
+
+pm2_stop() {
+  load_env
+  ensure_pm2
+  pm2 stop "${BASHY_NAME}" || true
+  print_info "PM2 stop signaled for ${BASHY_NAME}."
+}
+
+pm2_restart() {
+  load_env
+  ensure_pm2
+  if pm2 describe "${BASHY_NAME}" >/dev/null 2>&1; then
+    pm2 restart "${BASHY_NAME}"
+    print_info "PM2 restarted ${BASHY_NAME}."
+  else
+    pm2_start
+  fi
+}
+
+pm2_delete() {
+  load_env
+  ensure_pm2
+  pm2 delete "${BASHY_NAME}" || true
+  print_info "PM2 deleted ${BASHY_NAME}."
+}
+
+update_env_var_in_file() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  if [[ ! -f "${file}" ]]; then
+    printf "%s=%s\n" "${key}" "${value}" > "${file}"
+    return 0
+  fi
+  if grep -q "^${key}=" "${file}"; then
+    # macOS sed requires an empty extension with -i ""
+    sed -E -i '' "s|^${key}=.*$|${key}=${value}|" "${file}"
+  else
+    printf "%s=%s\n" "${key}" "${value}" >> "${file}"
+  fi
+}
+
+up_cmd() {
+  # If flags are provided or no config file, (re)initialize
+  if [[ $# -gt 0 || ! -f "${CONFIG_FILE}" ]]; then
+    init_cmd "$@"
+  else
+    load_env
+  fi
+
+  # Prepare application .env file from .env.example if available
+  local env_example_path="${BASHY_WORKDIR}/.env.example"
+  local env_path="${BASHY_WORKDIR}/.env"
+  if [[ -f "${env_example_path}" && ! -f "${env_path}" ]]; then
+    cp "${env_example_path}" "${env_path}"
+    print_info "Copied ${env_example_path} -> ${env_path}"
+  fi
+
+  # Ensure PORT and HOST in .env match Bashy config (if there is an .env)
+  if [[ -f "${env_path}" ]]; then
+    update_env_var_in_file "${env_path}" "PORT" "${BASHY_PORT}"
+    update_env_var_in_file "${env_path}" "HOST" "${BASHY_DOMAIN}"
+    print_info "Updated ${env_path} with PORT=${BASHY_PORT} HOST=${BASHY_DOMAIN}"
+  fi
+
+  # Ensure bashy directory is ignored by the target project's git
+  ensure_gitignore_bashy
+
+  # Register the local domain and start (or restart) the PM2 service
+  register_domain
+  pm2_restart
+  print_info "Service is up via PM2. Visit: http://${BASHY_DOMAIN}:${BASHY_PORT}"
+}
+
 status_agent() {
   load_env
-  local label="$(LABEL)"
-  if launchctl list | grep -q "${label}"; then
-    launchctl print "gui/$(id -u)/${label}" | sed -n '1,120p' | cat
-  else
-    print_info "${label} not loaded. Use ./bashy.sh install"
-  fi
+  ensure_pm2
+  pm2 status "${BASHY_NAME}" | cat
 }
 
 logs_cmd() {
   load_env
-  local log="$(LOG_FILE)"
+  ensure_pm2
   if [[ "${1:-}" == "--follow" ]]; then
-    tail -f "${log}"
+    pm2 logs "${BASHY_NAME}"
   else
-    tail -n 200 "${log}" || true
+    pm2 logs "${BASHY_NAME}" --lines 200 | cat
   fi
 }
 
@@ -260,9 +251,6 @@ domain:   ${BASHY_DOMAIN}
 port:     ${BASHY_PORT}
 workdir:  ${BASHY_WORKDIR}
 command:  ${BASHY_COMMAND}
-label:    $(LABEL)
-plist:    $(PLIST_PATH)
-log:      $(LOG_FILE)
 extra env:${BASHY_ENV_EXTRA}
 EOF
 }
@@ -296,7 +284,27 @@ init_cmd() {
   BASHY_ENV_EXTRA="${env_extra}"
 
   write_config
-  print_info "You can now run: ./bashy.sh register-domain && ./bashy.sh install"
+  print_info "You can now run: ./bashy.sh up"
+}
+
+# Ensure the embedded bashy directory is ignored by the target project's git
+ensure_gitignore_bashy() {
+  load_env
+  local gitignore_path="${BASHY_WORKDIR}/.gitignore"
+  local dir_name
+  dir_name="$(basename "${SCRIPT_DIR}")"
+  local entry="${dir_name}/"
+  mkdir -p "${BASHY_WORKDIR}"
+  touch "${gitignore_path}"
+  if ! grep -qxF "${entry}" "${gitignore_path}"; then
+    {
+      echo "# managed by bashy"
+      echo "${entry}"
+    } >> "${gitignore_path}"
+    print_info "Added ${entry} to ${gitignore_path}"
+  else
+    print_info "${entry} already present in ${gitignore_path}"
+  fi
 }
 
 cmd="${1:-help}"
@@ -304,12 +312,13 @@ shift || true
 
 case "${cmd}" in
   help|-h|--help) usage ;;
+  up) up_cmd "$@" ;;
   init) init_cmd "$@" ;;
-  install) install_agent ;;
-  uninstall) uninstall_agent ;;
-  start) start_agent ;;
-  stop) stop_agent ;;
-  restart) restart_agent ;;
+  start) pm2_start ;;
+  stop) pm2_stop ;;
+  restart) pm2_restart ;;
+  delete) pm2_delete ;;
+  save) ensure_pm2; pm2 save; print_info "PM2 process list saved." ;;
   status) status_agent ;;
   logs) logs_cmd "${1:-}" ;;
   register-domain) register_domain "${1:-}" ;;
